@@ -10,6 +10,7 @@
 #include <xkbcommon/xkbcommon.h>
 
 #include <algorithm>
+#include <cctype>
 #include <format>
 
 constexpr const char* SUBMAP_PREFIX = "hc:";
@@ -38,6 +39,137 @@ static std::vector<std::string> splitOn(const std::string& s, char sep) {
 
 static Hyprlang::CParseResult chordKeywordHandler(const char* COMMAND, const char* VALUE) {
     return g_chordManager.onChordKeyword(VALUE ? VALUE : "");
+}
+
+// ---- sxhkd-style sequence expansion: {a,b,c} groups, `_` = empty, X-Y ranges ----
+
+struct SExpansionPart {
+    std::vector<std::string>              literals; // always groups.size() + 1
+    std::vector<std::vector<std::string>> groups;
+};
+
+static size_t findTopLevelComma(const std::string& s) {
+    int depth = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '{')
+            depth++;
+        else if (s[i] == '}')
+            depth = std::max(0, depth - 1);
+        else if (s[i] == ',' && depth == 0)
+            return i;
+    }
+    return std::string::npos;
+}
+
+static std::expected<SExpansionPart, std::string> parseExpansionPart(const std::string& s) {
+    SExpansionPart part;
+    std::string    cur;
+
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '{') {
+            const auto CLOSE = s.find('}', i);
+            if (CLOSE == std::string::npos)
+                return std::unexpected("unmatched '{'");
+
+            part.literals.push_back(cur);
+            cur.clear();
+
+            std::vector<std::string> elems;
+            for (const auto& RAW : splitOn(s.substr(i + 1, CLOSE - i - 1), ',')) {
+                if (RAW == "_") {
+                    elems.push_back("");
+                    continue;
+                }
+                // single-char alnum range, e.g. 1-9 or a-e
+                if (RAW.size() == 3 && RAW[1] == '-' && RAW[0] <= RAW[2] &&
+                    ((isdigit(RAW[0]) && isdigit(RAW[2])) || (isalpha(RAW[0]) && isalpha(RAW[2])))) {
+                    for (char c = RAW[0]; c <= RAW[2]; ++c)
+                        elems.emplace_back(1, c);
+                    continue;
+                }
+                elems.push_back(RAW);
+            }
+
+            if (elems.empty())
+                return std::unexpected("empty {} group");
+
+            part.groups.push_back(elems);
+            i = CLOSE;
+        } else if (s[i] == '}')
+            return std::unexpected("unmatched '}'");
+        else
+            cur += s[i];
+    }
+
+    part.literals.push_back(cur);
+    return part;
+}
+
+static std::string buildFromPart(const SExpansionPart& part, const std::vector<size_t>& idx) {
+    std::string out = part.literals[0];
+    for (size_t j = 0; j < part.groups.size(); ++j) {
+        if (!idx.empty())
+            out += part.groups[j][idx[j]];
+        out += part.literals[j + 1];
+    }
+    return out;
+}
+
+// expands one chord line into its sequence-expanded variants. Group i of the key
+// sequence pairs with group i of the command part; the product across groups is taken.
+static std::expected<std::vector<std::string>, std::string> expandChordLine(const std::string& value) {
+    constexpr size_t MAXEXPANSIONS = 512;
+
+    const auto       COMMA = findTopLevelComma(value);
+    if (COMMA == std::string::npos)
+        return std::unexpected("expected: chord = STEP ; STEP ; ... , dispatcher , arg");
+
+    auto seqPart = parseExpansionPart(value.substr(0, COMMA));
+    if (!seqPart)
+        return std::unexpected(seqPart.error() + " in the key sequence");
+
+    // no groups in the key sequence -> no expansion; braces in the command stay literal
+    if (seqPart->groups.empty())
+        return std::vector{value};
+
+    auto restPart = parseExpansionPart(value.substr(COMMA + 1));
+    if (!restPart)
+        return std::unexpected(restPart.error() + " in the command");
+
+    const size_t K = seqPart->groups.size();
+    const size_t M = restPart->groups.size();
+    if (M != 0 && M != K)
+        return std::unexpected(std::format("mismatched {{}} group counts: {} in the key sequence but {} in the command", K, M));
+    for (size_t j = 0; j < M; ++j) {
+        if (restPart->groups[j].size() != seqPart->groups[j].size())
+            return std::unexpected(std::format("{{}} group {} has {} elements in the key sequence but {} in the command", j + 1, seqPart->groups[j].size(),
+                                               restPart->groups[j].size()));
+    }
+
+    size_t total = 1;
+    for (const auto& G : seqPart->groups) {
+        total *= G.size();
+        if (total > MAXEXPANSIONS)
+            return std::unexpected(std::format("expansion produces more than {} chords", MAXEXPANSIONS));
+    }
+
+    std::vector<std::string> out;
+    std::vector<size_t>      idx(K, 0);
+    const std::vector<size_t> NOIDX;
+    while (true) {
+        out.push_back(buildFromPart(*seqPart, idx) + "," + buildFromPart(*restPart, M ? idx : NOIDX));
+
+        size_t j = 0;
+        for (; j < K; ++j) {
+            if (++idx[j] < seqPart->groups[j].size())
+                break;
+            idx[j] = 0;
+        }
+        if (j == K)
+            break;
+    }
+
+    return out;
 }
 
 bool CChordManager::init(HANDLE handle) {
@@ -101,15 +233,25 @@ void CChordManager::shutdown() {
 Hyprlang::CParseResult CChordManager::onChordKeyword(const std::string& value) {
     Hyprlang::CParseResult result;
 
-    auto                   parsed = parseChordLine(value);
-    if (!parsed) {
-        result.setError(("hyprchords: " + parsed.error()).c_str());
+    const auto             EXPANDED = expandChordLine(value);
+    if (!EXPANDED) {
+        result.setError(("hyprchords: " + EXPANDED.error()).c_str());
         return result;
     }
 
-    if (const auto ERR = registerChord(*parsed)) {
-        result.setError(("hyprchords: " + *ERR).c_str());
-        return result;
+    for (const auto& LINE : *EXPANDED) {
+        const auto CONTEXT = EXPANDED->size() > 1 ? std::format(" (expanded to '{}')", Hyprutils::String::trim(LINE)) : "";
+
+        auto       parsed = parseChordLine(LINE);
+        if (!parsed) {
+            result.setError(("hyprchords: " + parsed.error() + CONTEXT).c_str());
+            return result;
+        }
+
+        if (const auto ERR = registerChord(*parsed)) {
+            result.setError(("hyprchords: " + *ERR + CONTEXT).c_str());
+            return result;
+        }
     }
 
     return result;

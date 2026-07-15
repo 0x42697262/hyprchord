@@ -31,6 +31,30 @@ plugin {
 
 Syntax: `chord = STEP ; STEP ; ... , dispatcher , arg`
 
+### Sequence expansion (sxhkd `{...}` groups)
+
+One `chord` line can expand into many, exactly like sxhkd:
+
+```ini
+# workspaces: SUPER+1..9,0 focuses, SUPER+SHIFT+1..9,0 moves the window
+chord = SUPER+{_,SHIFT+}{1-9,0} , {workspace,movetoworkspace} , {1-9,10}
+
+# directional resize
+chord = SUPER+ALT+{J,L,K,semicolon} , resizeactive , {-20 0,0 20,0 -20,20 0}
+
+# expansion works inside chains too
+chord = SUPER+R ; {Q,R,W} , exec , notify-send rotate-{270,180,90}
+```
+
+- `{a,b,c}` in the key sequence expands the line once per element; the i-th
+  group in the key sequence pairs element-wise with the i-th group after the
+  comma. Multiple groups take the cartesian product.
+- `_` is the empty element (`{_,SHIFT+}` = "without / with SHIFT").
+- Single-character ranges expand: `{1-9,0}` = `1,2,...,9,0`, `{a-e}` etc.
+- If the command part has no groups it's reused verbatim for every expansion.
+- Braces in the command stay literal when the key sequence has no groups
+  (so `exec , awk '{print $1}'` is safe); at most 512 expansions per line.
+
 - Steps are separated by `;`. Within a step, modifiers and the key are joined
   with `+` (`SUPER+SHIFT+X`). `code:NN` is accepted for raw keycodes.
 - `@` prefix on a key: trigger on release. `~` prefix: also pass the key event
