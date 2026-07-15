@@ -4,6 +4,7 @@
 #include <src/managers/KeybindManager.hpp>
 #include <src/managers/eventLoop/EventLoopManager.hpp>
 #include <src/config/shared/actions/ConfigActions.hpp>
+#include <src/event/EventBus.hpp>
 #include <src/SharedDefs.hpp>
 
 #include <hyprutils/string/String.hpp>
@@ -503,7 +504,7 @@ SDispatchResult CChordManager::exec(const std::string& idxStr) {
 
     // reset before dispatching, so a dispatcher that sets its own submap wins
     if (inOurSubmap())
-        Config::Actions::setSubmap("reset");
+        (void)Config::Actions::setSubmap("reset");
     if (m_timer)
         m_timer->updateTimeout(std::nullopt);
 
@@ -582,7 +583,7 @@ bool CChordManager::inOurSubmap() const {
 
 void CChordManager::leaveOurSubmap() {
     if (inOurSubmap())
-        Config::Actions::setSubmap("reset");
+        (void)Config::Actions::setSubmap("reset");
     if (m_timer)
         m_timer->updateTimeout(std::nullopt);
 }
