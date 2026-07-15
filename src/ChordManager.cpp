@@ -2,6 +2,7 @@
 #include "globals.hpp"
 
 #include <src/managers/KeybindManager.hpp>
+#include <src/managers/EventManager.hpp>
 #include <src/managers/eventLoop/EventLoopManager.hpp>
 #include <src/config/shared/actions/ConfigActions.hpp>
 #include <src/event/EventBus.hpp>
@@ -21,8 +22,20 @@ static std::string    lower(std::string s) {
     return s;
 }
 
+static std::string upper(std::string s) {
+    std::ranges::transform(s, s.begin(), ::toupper);
+    return s;
+}
+
 static void notify(const std::string& msg) {
     HyprlandAPI::addNotificationV2(PHANDLE, {{"text", "[hyprchords] " + msg}, {"time", uint64_t{10000}}, {"color", CHyprColor{0}}, {"icon", ICON_WARNING}});
+}
+
+// status events on the IPC socket (socket2), sxhkd's status fifo equivalent:
+// hyprchords>>fire,<chord>,<dispatcher>,<arg> | abort | timeout | lock,<submap> | enabled | disabled
+static void ipcEvent(const std::string& data) {
+    if (g_pEventManager)
+        g_pEventManager->postEvent(SHyprIPCEvent{.event = "hyprchords", .data = data});
 }
 
 static std::vector<std::string> splitOn(const std::string& s, char sep) {
@@ -42,16 +55,29 @@ static Hyprlang::CParseResult chordKeywordHandler(const char* COMMAND, const cha
     return g_chordManager.onChordKeyword(VALUE ? VALUE : "");
 }
 
-// ---- sxhkd-style sequence expansion: {a,b,c} groups, `_` = empty, X-Y ranges ----
+// ---- sxhkd-style sequence expansion: {a,b,c} groups, `_` = empty, X-Y ranges, \{ \} escapes ----
 
 struct SExpansionPart {
     std::vector<std::string>              literals; // always groups.size() + 1
     std::vector<std::vector<std::string>> groups;
 };
 
+struct SExpandedChord {
+    std::vector<std::string> lines;
+    bool                     cycle = false; // command-only groups: variants cycle per press
+};
+
+static bool isEscapedBrace(const std::string& s, size_t i) {
+    return s[i] == '\\' && i + 1 < s.size() && (s[i + 1] == '{' || s[i + 1] == '}');
+}
+
 static size_t findTopLevelComma(const std::string& s) {
     int depth = 0;
     for (size_t i = 0; i < s.size(); ++i) {
+        if (isEscapedBrace(s, i)) {
+            i++;
+            continue;
+        }
         if (s[i] == '{')
             depth++;
         else if (s[i] == '}')
@@ -62,44 +88,71 @@ static size_t findTopLevelComma(const std::string& s) {
     return std::string::npos;
 }
 
+static void pushElement(std::vector<std::string>& elems, const std::string& raw) {
+    const auto E = Hyprutils::String::trim(raw);
+    if (E == "_") {
+        elems.push_back("");
+        return;
+    }
+    // single-char alnum range, e.g. 1-9 or a-e
+    if (E.size() == 3 && E[1] == '-' && E[0] <= E[2] && ((isdigit(E[0]) && isdigit(E[2])) || (isalpha(E[0]) && isalpha(E[2])))) {
+        for (char c = E[0]; c <= E[2]; ++c)
+            elems.emplace_back(1, c);
+        return;
+    }
+    elems.push_back(E);
+}
+
 static std::expected<SExpansionPart, std::string> parseExpansionPart(const std::string& s) {
     SExpansionPart part;
     std::string    cur;
 
     for (size_t i = 0; i < s.size(); ++i) {
+        if (isEscapedBrace(s, i)) {
+            cur += s[i + 1];
+            i++;
+            continue;
+        }
         if (s[i] == '{') {
-            const auto CLOSE = s.find('}', i);
-            if (CLOSE == std::string::npos)
-                return std::unexpected("unmatched '{'");
-
-            part.literals.push_back(cur);
-            cur.clear();
-
             std::vector<std::string> elems;
-            for (const auto& RAW : splitOn(s.substr(i + 1, CLOSE - i - 1), ',')) {
-                if (RAW == "_") {
-                    elems.push_back("");
+            std::string              elem;
+            size_t                   close = std::string::npos;
+
+            for (size_t j = i + 1; j < s.size(); ++j) {
+                if (isEscapedBrace(s, j)) {
+                    elem += s[j + 1];
+                    j++;
                     continue;
                 }
-                // single-char alnum range, e.g. 1-9 or a-e
-                if (RAW.size() == 3 && RAW[1] == '-' && RAW[0] <= RAW[2] &&
-                    ((isdigit(RAW[0]) && isdigit(RAW[2])) || (isalpha(RAW[0]) && isalpha(RAW[2])))) {
-                    for (char c = RAW[0]; c <= RAW[2]; ++c)
-                        elems.emplace_back(1, c);
+                if (s[j] == '{')
+                    return std::unexpected("nested '{'");
+                if (s[j] == '}') {
+                    close = j;
+                    break;
+                }
+                if (s[j] == ',') {
+                    pushElement(elems, elem);
+                    elem.clear();
                     continue;
                 }
-                elems.push_back(RAW);
+                elem += s[j];
             }
 
+            if (close == std::string::npos)
+                return std::unexpected("unmatched '{'");
+            pushElement(elems, elem);
             if (elems.empty())
                 return std::unexpected("empty {} group");
 
+            part.literals.push_back(cur);
+            cur.clear();
             part.groups.push_back(elems);
-            i = CLOSE;
-        } else if (s[i] == '}')
+            i = close;
+            continue;
+        }
+        if (s[i] == '}')
             return std::unexpected("unmatched '}'");
-        else
-            cur += s[i];
+        cur += s[i];
     }
 
     part.literals.push_back(cur);
@@ -118,7 +171,8 @@ static std::string buildFromPart(const SExpansionPart& part, const std::vector<s
 
 // expands one chord line into its sequence-expanded variants. Group i of the key
 // sequence pairs with group i of the command part; the product across groups is taken.
-static std::expected<std::vector<std::string>, std::string> expandChordLine(const std::string& value) {
+// Groups only in the command part make a cycling chord (variants alternate per press).
+static std::expected<SExpandedChord, std::string> expandChordLine(const std::string& value) {
     constexpr size_t MAXEXPANSIONS = 512;
 
     const auto       COMMA = findTopLevelComma(value);
@@ -128,17 +182,34 @@ static std::expected<std::vector<std::string>, std::string> expandChordLine(cons
     auto seqPart = parseExpansionPart(value.substr(0, COMMA));
     if (!seqPart)
         return std::unexpected(seqPart.error() + " in the key sequence");
-
-    // no groups in the key sequence -> no expansion; braces in the command stay literal
-    if (seqPart->groups.empty())
-        return std::vector{value};
-
     auto restPart = parseExpansionPart(value.substr(COMMA + 1));
     if (!restPart)
         return std::unexpected(restPart.error() + " in the command");
 
-    const size_t K = seqPart->groups.size();
-    const size_t M = restPart->groups.size();
+    const size_t              K = seqPart->groups.size();
+    const size_t              M = restPart->groups.size();
+    const std::vector<size_t> NOIDX;
+
+    if (K == 0) {
+        if (M == 0)
+            return SExpandedChord{.lines = {buildFromPart(*seqPart, NOIDX) + "," + buildFromPart(*restPart, NOIDX)}};
+
+        // command-only groups: sxhkd cycling — all groups advance together, one step per press
+        const size_t N = restPart->groups[0].size();
+        for (const auto& G : restPart->groups) {
+            if (G.size() != N)
+                return std::unexpected("cycling command {} groups must all have the same number of elements");
+        }
+        if (N > MAXEXPANSIONS)
+            return std::unexpected(std::format("cycle has more than {} variants", MAXEXPANSIONS));
+
+        SExpandedChord out{.lines = {}, .cycle = N > 1};
+        const auto     SEQSTR = buildFromPart(*seqPart, NOIDX);
+        for (size_t t = 0; t < N; ++t)
+            out.lines.push_back(SEQSTR + "," + buildFromPart(*restPart, std::vector<size_t>(M, t)));
+        return out;
+    }
+
     if (M != 0 && M != K)
         return std::unexpected(std::format("mismatched {{}} group counts: {} in the key sequence but {} in the command", K, M));
     for (size_t j = 0; j < M; ++j) {
@@ -154,11 +225,10 @@ static std::expected<std::vector<std::string>, std::string> expandChordLine(cons
             return std::unexpected(std::format("expansion produces more than {} chords", MAXEXPANSIONS));
     }
 
-    std::vector<std::string> out;
-    std::vector<size_t>      idx(K, 0);
-    const std::vector<size_t> NOIDX;
+    SExpandedChord      out;
+    std::vector<size_t> idx(K, 0);
     while (true) {
-        out.push_back(buildFromPart(*seqPart, idx) + "," + buildFromPart(*restPart, M ? idx : NOIDX));
+        out.lines.push_back(buildFromPart(*seqPart, idx) + "," + buildFromPart(*restPart, M ? idx : NOIDX));
 
         size_t j = 0;
         for (; j < K; ++j) {
@@ -173,14 +243,89 @@ static std::expected<std::vector<std::string>, std::string> expandChordLine(cons
     return out;
 }
 
+// ---- step parsing helpers ----
+
+// splits the key sequence on ';' and ':' separators. bool = the separator BEFORE the
+// step was ':' (locked chain). ':' right after "code"/"mouse" is part of the token.
+static std::vector<std::pair<std::string, bool>> splitSteps(const std::string& seq) {
+    std::vector<std::pair<std::string, bool>> out;
+    size_t                                    start    = 0;
+    bool                                      lockNext = false;
+
+    for (size_t i = 0; i < seq.size(); ++i) {
+        const char C = seq[i];
+        if (C != ';' && C != ':')
+            continue;
+
+        if (C == ':') {
+            std::string word;
+            for (size_t j = i; j > start;) {
+                --j;
+                if (isalpha(static_cast<unsigned char>(seq[j])))
+                    word.insert(word.begin(), seq[j]);
+                else
+                    break;
+            }
+            if (word == "code" || word == "mouse")
+                continue;
+        }
+
+        out.emplace_back(Hyprutils::String::trim(seq.substr(start, i - start)), lockNext);
+        lockNext = C == ':';
+        start    = i + 1;
+    }
+
+    out.emplace_back(Hyprutils::String::trim(seq.substr(start)), lockNext);
+    return out;
+}
+
+// sxhkd modifier names Hyprland's stringToModMask doesn't know
+static uint32_t modTokenToMask(const std::string& token) {
+    const auto T = upper(token);
+    if (T == "LOCK")
+        return g_pKeybindManager->stringToModMask("CAPS");
+    if (T == "HYPER")
+        return g_pKeybindManager->stringToModMask("MOD3");
+    if (T == "MODE_SWITCH")
+        return g_pKeybindManager->stringToModMask("MOD5");
+    return g_pKeybindManager->stringToModMask(T);
+}
+
+// sxhkd button1..button24 -> Hyprland mouse:NNN (linux BTN_* codes)
+static std::expected<std::string, std::string> buttonToMouseKey(const std::string& token) {
+    int n = 0;
+    try {
+        n = std::stoi(token.substr(6));
+    } catch (...) { return std::unexpected("invalid button: " + token); }
+
+    switch (n) {
+        case 1: return "mouse:272"; // left
+        case 2: return "mouse:274"; // middle
+        case 3: return "mouse:273"; // right
+        case 8: return "mouse:275"; // back / side
+        case 9: return "mouse:276"; // forward / extra
+        case 4:
+        case 5:
+        case 6:
+        case 7: return std::unexpected(token + ": scroll wheel events cannot be chord steps");
+        default: return std::unexpected("unsupported button: " + token + " (use mouse:NNN with a linux BTN code)");
+    }
+}
+
+// ---- CChordManager ----
+
 bool CChordManager::init(HANDLE handle) {
     m_timeout    = makeShared<Config::Values::CIntValue>("plugin:hyprchords:timeout", "pending chain timeout in ms, 0 disables the timeout", 3000,
                                                          Config::Values::SIntValueOptions{.min = 0});
     m_abortKey   = makeShared<Config::Values::CStringValue>("plugin:hyprchords:abort_key", "key that aborts a pending chain", "Escape");
     m_stickyMods = makeShared<Config::Values::CIntValue>("plugin:hyprchords:sticky_mods", "modless steps also match with the previous step's modifiers still held", 1,
                                                          Config::Values::SIntValueOptions{.min = 0, .max = 1});
+    m_swallow    = makeShared<Config::Values::CIntValue>(
+        "plugin:hyprchords:swallow", "1: unmatched keys abort a pending chain and are swallowed; 0: they pass to apps and the chain stays pending (sxhkd behavior)", 1,
+        Config::Values::SIntValueOptions{.min = 0, .max = 1});
 
-    if (!HyprlandAPI::addConfigValueV2(handle, m_timeout) || !HyprlandAPI::addConfigValueV2(handle, m_abortKey) || !HyprlandAPI::addConfigValueV2(handle, m_stickyMods))
+    if (!HyprlandAPI::addConfigValueV2(handle, m_timeout) || !HyprlandAPI::addConfigValueV2(handle, m_abortKey) || !HyprlandAPI::addConfigValueV2(handle, m_stickyMods) ||
+        !HyprlandAPI::addConfigValueV2(handle, m_swallow))
         return false;
 
     // no V2 equivalent exists for plugin config keywords yet
@@ -192,7 +337,8 @@ bool CChordManager::init(HANDLE handle) {
 
     if (!HyprlandAPI::addDispatcherV2(handle, "hyprchords_enter", [](std::string arg) { return g_chordManager.enter(arg); }) ||
         !HyprlandAPI::addDispatcherV2(handle, "hyprchords_exec", [](std::string arg) { return g_chordManager.exec(arg); }) ||
-        !HyprlandAPI::addDispatcherV2(handle, "hyprchords_abort", [](std::string arg) { return g_chordManager.abort(arg); }))
+        !HyprlandAPI::addDispatcherV2(handle, "hyprchords_abort", [](std::string arg) { return g_chordManager.abort(arg); }) ||
+        !HyprlandAPI::addDispatcherV2(handle, "hyprchords_toggle", [](std::string arg) { return g_chordManager.toggle(arg); }))
         return false;
 
     m_timer = makeShared<CEventLoopTimer>(std::nullopt, [](SP<CEventLoopTimer>, void*) { g_chordManager.onTimeout(); }, nullptr);
@@ -201,8 +347,11 @@ bool CChordManager::init(HANDLE handle) {
     m_preReloadListener = Event::bus()->m_events.config.preReload.listen([this] { onPreReload(); });
     m_reloadedListener  = Event::bus()->m_events.config.reloaded.listen([this] { onReloaded(); });
     m_submapListener    = Event::bus()->m_events.keybinds.submap.listen([this](const std::string& submap) {
-        if (!submap.starts_with(SUBMAP_PREFIX) && m_timer)
-            m_timer->updateTimeout(std::nullopt);
+        if (!submap.starts_with(SUBMAP_PREFIX)) {
+            m_locked = false;
+            if (m_timer)
+                m_timer->updateTimeout(std::nullopt);
+        }
     });
 
     return true;
@@ -227,6 +376,7 @@ void CChordManager::shutdown() {
     m_chords.clear();
     m_submaps.clear();
     m_bindOwners.clear();
+    m_binds.clear();
     m_rootSteps.clear();
     m_warnings.clear();
 }
@@ -240,8 +390,29 @@ Hyprlang::CParseResult CChordManager::onChordKeyword(const std::string& value) {
         return result;
     }
 
-    for (const auto& LINE : *EXPANDED) {
-        const auto CONTEXT = EXPANDED->size() > 1 ? std::format(" (expanded to '{}')", Hyprutils::String::trim(LINE)) : "";
+    if (EXPANDED->cycle) {
+        // same key sequence, cycling command variants
+        SChord base;
+        for (size_t i = 0; i < EXPANDED->lines.size(); ++i) {
+            auto parsed = parseChordLine(EXPANDED->lines[i]);
+            if (!parsed) {
+                result.setError(std::format("hyprchords: {} (cycle variant '{}')", parsed.error(), Hyprutils::String::trim(EXPANDED->lines[i])).c_str());
+                return result;
+            }
+            if (i == 0)
+                base = *parsed;
+            base.cycle.emplace_back(parsed->dispatcher, parsed->arg);
+        }
+
+        if (const auto ERR = registerChord(base)) {
+            result.setError(("hyprchords: " + *ERR).c_str());
+            return result;
+        }
+        return result;
+    }
+
+    for (const auto& LINE : EXPANDED->lines) {
+        const auto CONTEXT = EXPANDED->lines.size() > 1 ? std::format(" (expanded to '{}')", Hyprutils::String::trim(LINE)) : "";
 
         auto       parsed = parseChordLine(LINE);
         if (!parsed) {
@@ -259,7 +430,7 @@ Hyprlang::CParseResult CChordManager::onChordKeyword(const std::string& value) {
 }
 
 std::expected<SChord, std::string> CChordManager::parseChordLine(const std::string& value) {
-    // chord = STEP ; STEP ; ... , dispatcher , arg
+    // STEP (;|:) STEP ... , dispatcher , arg   — braces are already expanded here
     const auto FIRSTCOMMA = value.find(',');
     if (FIRSTCOMMA == std::string::npos)
         return std::unexpected("expected: chord = STEP ; STEP ; ... , dispatcher , arg");
@@ -285,16 +456,23 @@ std::expected<SChord, std::string> CChordManager::parseChordLine(const std::stri
     if (!g_pKeybindManager->m_dispatchers.contains(chord.dispatcher))
         return std::unexpected("no such dispatcher: " + chord.dispatcher);
 
-    for (const auto& RAWSTEP : splitOn(SEQ, ';')) {
+    for (const auto& [RAWSTEP, LOCK] : splitSteps(SEQ)) {
         if (RAWSTEP.empty())
             return std::unexpected("empty step in chord sequence");
 
         SChordStep step;
-        auto       tokens = splitOn(RAWSTEP, '+');
+        step.lockChain = LOCK;
+
+        auto tokens = splitOn(RAWSTEP, '+');
         for (size_t i = 0; i + 1 < tokens.size(); ++i) {
             if (tokens[i].empty())
                 return std::unexpected("empty modifier in step '" + RAWSTEP + "'");
-            const auto MASK = g_pKeybindManager->stringToModMask(tokens[i]);
+            if (upper(tokens[i]) == "ANY") {
+                step.anyMods = true;
+                step.hasMods = true;
+                continue;
+            }
+            const auto MASK = modTokenToMask(tokens[i]);
             if (!MASK)
                 return std::unexpected("unknown modifier: " + tokens[i]);
             step.modmask |= MASK;
@@ -312,16 +490,28 @@ std::expected<SChord, std::string> CChordManager::parseChordLine(const std::stri
 
         if (keyTok.empty())
             return std::unexpected("missing key in step '" + RAWSTEP + "'");
-        if (keyTok.contains(':') && !keyTok.starts_with("code:"))
-            return std::unexpected("':' (locked chains) is not supported yet, use ';'");
 
-        if (keyTok.starts_with("code:")) {
+        const auto KEYLOWER = lower(keyTok);
+        if (KEYLOWER.starts_with("button")) {
+            auto mapped = buttonToMouseKey(KEYLOWER);
+            if (!mapped)
+                return std::unexpected(mapped.error());
+            step.key = *mapped;
+        } else if (KEYLOWER.starts_with("mouse:")) {
+            try {
+                if (std::stoul(KEYLOWER.substr(6)) == 0)
+                    return std::unexpected("invalid mouse button: " + keyTok);
+            } catch (...) { return std::unexpected("invalid mouse button: " + keyTok); }
+            step.key = KEYLOWER;
+        } else if (KEYLOWER.starts_with("code:")) {
             try {
                 step.keycode = std::stoul(keyTok.substr(5));
             } catch (...) { return std::unexpected("invalid keycode in step '" + RAWSTEP + "'"); }
             if (!step.keycode)
                 return std::unexpected("invalid keycode in step '" + RAWSTEP + "'");
         } else {
+            if (keyTok.contains(':'))
+                return std::unexpected("unexpected ':' in key '" + keyTok + "'");
             if (xkb_keysym_from_name(keyTok.c_str(), XKB_KEYSYM_NO_FLAGS) == XKB_KEY_NoSymbol &&
                 xkb_keysym_from_name(keyTok.c_str(), XKB_KEYSYM_CASE_INSENSITIVE) == XKB_KEY_NoSymbol)
                 return std::unexpected("unknown key: " + keyTok);
@@ -332,7 +522,7 @@ std::expected<SChord, std::string> CChordManager::parseChordLine(const std::stri
         std::string repr;
         for (size_t i = 0; i + 1 < tokens.size(); ++i)
             repr += lower(tokens[i]) + "+";
-        repr += lower(keyTok);
+        repr += KEYLOWER;
         step.repr = repr;
 
         chord.steps.push_back(step);
@@ -340,10 +530,14 @@ std::expected<SChord, std::string> CChordManager::parseChordLine(const std::stri
 
     if (chord.steps.empty())
         return std::unexpected("empty chord sequence");
+    if (chord.steps.front().lockChain)
+        return std::unexpected("a chord cannot start with ':'");
+
+    chord.lockOnFire = chord.steps.back().lockChain;
 
     std::string repr;
-    for (const auto& s : chord.steps)
-        repr += (repr.empty() ? "" : " ; ") + s.repr;
+    for (size_t i = 0; i < chord.steps.size(); ++i)
+        repr += (i == 0 ? "" : chord.steps[i].lockChain ? " : " : " ; ") + chord.steps[i].repr;
     chord.repr = repr;
 
     return chord;
@@ -374,17 +568,23 @@ std::optional<std::string> CChordManager::registerChord(const SChord& chord) {
         const std::string NEXTSUBMAP = SUBMAP_PREFIX + prefix;
 
         const std::string HANDLER = FINAL ? "hyprchords_exec" : "hyprchords_enter";
-        const std::string ARG     = FINAL ? std::to_string(IDX) : NEXTSUBMAP;
+        const std::string ARG     = FINAL ? std::to_string(IDX) : (STEP.lockChain ? "+" : "") + NEXTSUBMAP;
         const std::string OWNER   = HANDLER + "|" + ARG;
 
-        std::set<uint32_t> masks = {STEP.hasMods ? STEP.modmask : 0};
-        if (!STEP.hasMods && STICKY && stickyMask)
-            masks.insert(stickyMask);
-        if (STEP.hasMods)
-            stickyMask = STEP.modmask;
+        // (modmask, ignoreMods) bind variants for this step
+        std::vector<std::pair<uint32_t, bool>> variants;
+        if (STEP.anyMods)
+            variants = {{0, true}};
+        else {
+            variants = {{STEP.hasMods ? STEP.modmask : 0, false}};
+            if (!STEP.hasMods && STICKY && stickyMask)
+                variants.emplace_back(stickyMask, false);
+            if (STEP.hasMods)
+                stickyMask = STEP.modmask;
+        }
 
-        for (const auto MASK : masks) {
-            const auto IDENTITY = std::format("{}|{}|{}|{}|{}", BINDSUBMAP, MASK, lower(STEP.key), STEP.keycode, STEP.release);
+        for (const auto& [MASK, ANYMODS] : variants) {
+            const auto IDENTITY = std::format("{}|{}|{}|{}|{}", BINDSUBMAP, ANYMODS ? "any" : std::to_string(MASK), lower(STEP.key), STEP.keycode, STEP.release);
 
             if (const auto IT = m_bindOwners.find(IDENTITY); IT != m_bindOwners.end()) {
                 if (IT->second == OWNER)
@@ -395,17 +595,21 @@ std::optional<std::string> CChordManager::registerChord(const SChord& chord) {
             }
 
             SKeybind bind;
-            bind.key            = STEP.key;
-            bind.keycode        = STEP.keycode;
-            bind.modmask        = MASK;
-            bind.handler        = HANDLER;
-            bind.arg            = ARG;
-            bind.submap         = SSubmap{.name = BINDSUBMAP, .reset = ""};
-            bind.release        = STEP.release;
-            bind.nonConsuming   = STEP.passthrough;
-            bind.description    = FINAL ? std::format("hyprchords: {} -> {} {}", chord.repr, chord.dispatcher, chord.arg) : std::format("hyprchords: chain {} ...", prefix);
+            bind.key          = STEP.key;
+            bind.keycode      = STEP.keycode;
+            bind.modmask      = MASK;
+            bind.ignoreMods   = ANYMODS;
+            bind.handler      = HANDLER;
+            bind.arg          = ARG;
+            bind.submap       = SSubmap{.name = BINDSUBMAP, .reset = ""};
+            bind.release      = STEP.release;
+            bind.nonConsuming = STEP.passthrough;
+            bind.enabled      = m_enabled;
+            bind.description  = FINAL ? (chord.cycle.size() > 1 ? std::format("hyprchords: {} -> cycles {} commands", chord.repr, chord.cycle.size()) :
+                                                                  std::format("hyprchords: {} -> {} {}", chord.repr, chord.dispatcher, chord.arg)) :
+                                        std::format("hyprchords: chain {} ...", prefix);
             bind.hasDescription = true;
-            bind.displayKey     = std::format("hyprchords:{}:{}:{}", IDX, i, MASK);
+            bind.displayKey     = std::format("hyprchords:{}:{}:{}", IDX, i, ANYMODS ? "any" : std::to_string(MASK));
 
             pending.push_back(SPending{.bind = bind, .identity = IDENTITY, .owner = OWNER, .stepKeyLower = lower(STEP.key)});
         }
@@ -449,10 +653,14 @@ void CChordManager::ensureSubmapMachinery(const std::string& submapName) {
     abortBind.handler        = "hyprchords_abort";
     abortBind.arg            = "key";
     abortBind.submap         = SSubmap{.name = submapName, .reset = ""};
+    abortBind.enabled        = m_enabled;
     abortBind.description    = "hyprchords: abort chain";
     abortBind.hasDescription = true;
     abortBind.displayKey     = "hyprchords:abort:" + submapName;
     addBind(abortBind);
+
+    if (m_swallow && !m_swallow->value())
+        return; // sxhkd behavior: unmatched keys pass through, chain stays pending
 
     SKeybind catchallBind;
     catchallBind.catchAll       = true;
@@ -460,6 +668,7 @@ void CChordManager::ensureSubmapMachinery(const std::string& submapName) {
     catchallBind.handler        = "hyprchords_abort";
     catchallBind.arg            = "catchall";
     catchallBind.submap         = SSubmap{.name = submapName, .reset = ""};
+    catchallBind.enabled        = m_enabled;
     catchallBind.description    = "hyprchords: abort chain (unmatched key)";
     catchallBind.hasDescription = true;
     catchallBind.displayKey     = "hyprchords:catchall:" + submapName;
@@ -468,21 +677,31 @@ void CChordManager::ensureSubmapMachinery(const std::string& submapName) {
 
 SP<SKeybind> CChordManager::addBind(SKeybind bind) {
     auto sp = g_pKeybindManager->addKeybind(std::move(bind));
-    if (sp)
+    if (sp) {
         m_displayKeys.push_back(sp->displayKey);
+        m_binds.push_back(sp);
+    }
     return sp;
 }
 
-SDispatchResult CChordManager::enter(const std::string& submapName) {
-    auto res = Config::Actions::setSubmap(submapName);
+SDispatchResult CChordManager::enter(const std::string& arg) {
+    const bool LOCKS = arg.starts_with("+");
+    const auto NAME  = LOCKS ? arg.substr(1) : arg;
+
+    auto       res = Config::Actions::setSubmap(NAME);
     if (!res)
         return SDispatchResult{.success = false, .error = "hyprchords: " + res.error().message};
 
     armEventGuard();
 
+    if (LOCKS && !m_locked) {
+        m_locked = true;
+        ipcEvent("lock," + NAME);
+    }
+
     const auto TIMEOUT = m_timeout ? m_timeout->value() : 0;
     if (m_timer) {
-        if (TIMEOUT > 0)
+        if (!m_locked && TIMEOUT > 0)
             m_timer->updateTimeout(std::chrono::milliseconds(TIMEOUT));
         else
             m_timer->updateTimeout(std::nullopt);
@@ -500,20 +719,42 @@ SDispatchResult CChordManager::exec(const std::string& idxStr) {
     if (idx >= m_chords.size())
         return SDispatchResult{.success = false, .error = "hyprchords: stale chord index"};
 
+    auto& CHORD = m_chords[idx];
+
     armEventGuard();
 
-    // reset before dispatching, so a dispatcher that sets its own submap wins
-    if (inOurSubmap())
-        (void)Config::Actions::setSubmap("reset");
-    if (m_timer)
-        m_timer->updateTimeout(std::nullopt);
+    if (m_locked || CHORD.lockOnFire) {
+        // locked mode: stay resident at the chain tail, no timeout; only the abort key exits
+        if (!m_locked) {
+            m_locked = true;
+            ipcEvent("lock," + g_pKeybindManager->getCurrentSubmap().name);
+        }
+        if (m_timer)
+            m_timer->updateTimeout(std::nullopt);
+    } else {
+        // reset before dispatching, so a dispatcher that sets its own submap wins
+        if (inOurSubmap())
+            (void)Config::Actions::setSubmap("reset");
+        if (m_timer)
+            m_timer->updateTimeout(std::nullopt);
+    }
 
-    const auto& CHORD      = m_chords[idx];
-    const auto  DISPATCHER = g_pKeybindManager->m_dispatchers.find(CHORD.dispatcher);
+    std::string dispatcher = CHORD.dispatcher;
+    std::string arg        = CHORD.arg;
+    if (!CHORD.cycle.empty()) {
+        const auto& VARIANT = CHORD.cycle[CHORD.cyclePos % CHORD.cycle.size()];
+        dispatcher          = VARIANT.first;
+        arg                 = VARIANT.second;
+        CHORD.cyclePos      = (CHORD.cyclePos + 1) % CHORD.cycle.size();
+    }
+
+    ipcEvent(std::format("fire,{},{},{}", CHORD.repr, dispatcher, arg));
+
+    const auto DISPATCHER = g_pKeybindManager->m_dispatchers.find(dispatcher);
     if (DISPATCHER == g_pKeybindManager->m_dispatchers.end())
-        return SDispatchResult{.success = false, .error = "hyprchords: no such dispatcher: " + CHORD.dispatcher};
+        return SDispatchResult{.success = false, .error = "hyprchords: no such dispatcher: " + dispatcher};
 
-    return DISPATCHER->second(CHORD.arg);
+    return DISPATCHER->second(arg);
 }
 
 SDispatchResult CChordManager::abort(const std::string& mode) {
@@ -521,19 +762,48 @@ SDispatchResult CChordManager::abort(const std::string& mode) {
         return {};
 
     if (mode == "catchall") {
-        // the same key event already advanced or finished a chain: not a mismatch
+        // the same event already advanced or finished a chain: not a mismatch
         if (eventGuardMatches())
+            return {};
+        // locked mode: unmatched keys don't abort; only the abort key exits
+        if (m_locked)
             return {};
         // a bare modifier press (e.g. holding SUPER for the next step) must not abort
         if (g_pKeybindManager->keycodeToModifier(Config::Actions::state()->m_lastCode))
             return {};
     }
 
+    ipcEvent("abort");
     leaveOurSubmap();
     return {};
 }
 
+SDispatchResult CChordManager::toggle(const std::string& arg) {
+    if (arg == "on" || arg == "1" || arg == "enable")
+        m_enabled = true;
+    else if (arg == "off" || arg == "0" || arg == "disable")
+        m_enabled = false;
+    else
+        m_enabled = !m_enabled;
+
+    std::erase_if(m_binds, [](const auto& wp) { return wp.expired(); });
+    for (auto& WPBIND : m_binds) {
+        if (auto BIND = WPBIND.lock())
+            BIND->enabled = m_enabled;
+    }
+
+    if (!m_enabled)
+        leaveOurSubmap();
+
+    ipcEvent(m_enabled ? "enabled" : "disabled");
+    return {};
+}
+
 void CChordManager::onTimeout() {
+    if (m_locked)
+        return;
+    if (inOurSubmap())
+        ipcEvent("timeout");
     leaveOurSubmap();
 }
 
@@ -546,6 +816,7 @@ void CChordManager::onPreReload() {
     m_submaps.clear();
     m_bindOwners.clear();
     m_displayKeys.clear();
+    m_binds.clear();
     m_rootSteps.clear();
     m_warnings.clear();
     m_eventGuard.valid = false;
@@ -554,7 +825,7 @@ void CChordManager::onPreReload() {
 void CChordManager::onReloaded() {
     // warn about chord prefixes that collide with regular root binds: both would fire
     for (const auto& STEP : m_rootSteps) {
-        if (STEP.key.empty())
+        if (STEP.key.empty() || STEP.key.starts_with("mouse:"))
             continue;
         const auto SYM = xkb_keysym_from_name(STEP.key.c_str(), XKB_KEYSYM_CASE_INSENSITIVE);
         if (SYM == XKB_KEY_NoSymbol)
@@ -582,6 +853,7 @@ bool CChordManager::inOurSubmap() const {
 }
 
 void CChordManager::leaveOurSubmap() {
+    m_locked = false;
     if (inOurSubmap())
         (void)Config::Actions::setSubmap("reset");
     if (m_timer)
@@ -589,9 +861,13 @@ void CChordManager::leaveOurSubmap() {
 }
 
 void CChordManager::armEventGuard() {
-    m_eventGuard = {.timeMs = Config::Actions::state()->m_timeLastMs, .code = Config::Actions::state()->m_lastCode, .valid = true};
+    m_eventGuard = {.timeMs    = Config::Actions::state()->m_timeLastMs,
+                    .code      = Config::Actions::state()->m_lastCode,
+                    .mouseCode = Config::Actions::state()->m_lastMouseCode,
+                    .valid     = true};
 }
 
 bool CChordManager::eventGuardMatches() const {
-    return m_eventGuard.valid && m_eventGuard.timeMs == Config::Actions::state()->m_timeLastMs && m_eventGuard.code == Config::Actions::state()->m_lastCode;
+    return m_eventGuard.valid && m_eventGuard.timeMs == Config::Actions::state()->m_timeLastMs && m_eventGuard.code == Config::Actions::state()->m_lastCode &&
+        m_eventGuard.mouseCode == Config::Actions::state()->m_lastMouseCode;
 }

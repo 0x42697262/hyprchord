@@ -12,6 +12,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct SKeybind;
@@ -19,20 +20,25 @@ struct SKeybind;
 // one chord in a chain: [MODS +] [~][@]KEY
 struct SChordStep {
     uint32_t    modmask     = 0;
-    std::string key         = ""; // key name, empty when keycode is used
+    std::string key         = ""; // key name (or mouse:NNN), empty when keycode is used
     uint32_t    keycode     = 0;  // for code:NN steps
     bool        release     = false; // @ prefix
     bool        passthrough = false; // ~ prefix
+    bool        anyMods     = false; // "any" modifier -> matches every modifier state
+    bool        lockChain   = false; // preceded by ':' -> matching engages locked mode
     bool        hasMods     = false;
     std::string repr        = ""; // normalized "super+x"
 };
 
 // a full chain: steps + the dispatcher it fires
 struct SChord {
-    std::vector<SChordStep> steps;
-    std::string             dispatcher;
-    std::string             arg;
-    std::string             repr;
+    std::vector<SChordStep>                          steps;
+    std::string                                      dispatcher;
+    std::string                                      arg;
+    std::vector<std::pair<std::string, std::string>> cycle; // sxhkd cycling: command variants, advanced per fire
+    size_t                                           cyclePos   = 0;
+    bool                                             lockOnFire = false; // final step engages locked mode
+    std::string                                      repr;
 };
 
 class CChordManager {
@@ -45,7 +51,7 @@ class CChordManager {
   private:
     struct SSubmapInfo {
         std::set<std::string> stepKeys;             // lowercase key names bound as steps in this submap
-        bool                  hasMachinery = false; // abort-key + catchall binds added
+        bool                  hasMachinery = false; // abort-key (+ catchall) binds added
     };
 
     std::expected<SChord, std::string> parseChordLine(const std::string& value);
@@ -53,9 +59,10 @@ class CChordManager {
     void                               ensureSubmapMachinery(const std::string& submapName);
     SP<SKeybind>                       addBind(SKeybind bind);
 
-    SDispatchResult                    enter(const std::string& submapName);
+    SDispatchResult                    enter(const std::string& arg); // arg: [+]submap, '+' engages locked mode
     SDispatchResult                    exec(const std::string& idxStr);
     SDispatchResult                    abort(const std::string& mode);
+    SDispatchResult                    toggle(const std::string& arg);
 
     void                               onTimeout();
     void                               onPreReload();
@@ -63,7 +70,7 @@ class CChordManager {
     void                               leaveOurSubmap();
     bool                               inOurSubmap() const;
 
-    // identifies the key event that last entered/fired a chord, so the
+    // identifies the key/mouse event that last entered/fired a chord, so the
     // catchall abort bind firing on the same event can be ignored
     void                               armEventGuard();
     bool                               eventGuardMatches() const;
@@ -72,22 +79,28 @@ class CChordManager {
     std::map<std::string, SSubmapInfo>           m_submaps;
     std::map<std::string, std::string>           m_bindOwners; // bind identity -> "handler|arg", for dedupe/ambiguity
     std::vector<std::string>                     m_displayKeys;
+    std::vector<WP<SKeybind>>                    m_binds; // for hyprchords_toggle
     std::vector<SChordStep>                      m_rootSteps; // first chords, for conflict warnings
     std::vector<std::string>                     m_warnings;
+
+    bool                                         m_locked  = false; // a ':' chord matched; only the abort key exits
+    bool                                         m_enabled = true;  // hyprchords_toggle state
 
     SP<CEventLoopTimer>                          m_timer;
     SP<Config::Values::CIntValue>                m_timeout;
     SP<Config::Values::CStringValue>             m_abortKey;
     SP<Config::Values::CIntValue>                m_stickyMods;
+    SP<Config::Values::CIntValue>                m_swallow;
 
     Hyprutils::Signal::CHyprSignalListener       m_preReloadListener;
     Hyprutils::Signal::CHyprSignalListener       m_reloadedListener;
     Hyprutils::Signal::CHyprSignalListener       m_submapListener;
 
     struct {
-        uint32_t timeMs = 0;
-        uint32_t code   = 0;
-        bool     valid  = false;
+        uint32_t timeMs    = 0;
+        uint32_t code      = 0;
+        uint32_t mouseCode = 0;
+        bool     valid     = false;
     } m_eventGuard;
 };
 

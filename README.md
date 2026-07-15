@@ -20,16 +20,32 @@ plugin {
         timeout     = 3000    # ms a pending chain stays alive; 0 = no timeout
         abort_key   = Escape  # key that aborts a pending chain
         sticky_mods = 1       # modless steps also match with the previous step's mods held
+        swallow     = 1       # 1: unmatched keys abort the chain and are swallowed
+                              # 0: they pass to apps, chain stays pending (sxhkd behavior)
 
         chord = SUPER+X ; K , exec , kitty
         chord = SUPER+X ; F , exec , firefox
         chord = SUPER+A ; B ; C , exec , notify-send three-deep
         chord = SUPER+X ; ~@M , exec , notify-send release+passthrough
+
+        # ':' = locked mode: stays at the chain tail, repeat the final key freely,
+        # no timeout; only abort_key exits
+        chord = SUPER+R : H , resizeactive , -40 0
+        chord = SUPER+R : L , resizeactive ,  40 0
+
+        # command-only {} groups cycle per press (sxhkd cycling)
+        chord = SUPER+ALT+P , exec , hyprctl keyword cursor:no_warps {true,false}
+
+        # mouse buttons as steps (sxhkd button1..3,8,9 or raw mouse:NNN)
+        chord = SUPER+X ; button1 , exec , notify-send clicked
+
+        # "any" matches every modifier state
+        chord = any+XF86Calculator , exec , qalculate-gtk
     }
 }
 ```
 
-Syntax: `chord = STEP ; STEP ; ... , dispatcher , arg`
+Syntax: `chord = STEP (;|:) STEP ... , dispatcher , arg`
 
 ### Sequence expansion (sxhkd `{...}` groups)
 
@@ -52,27 +68,59 @@ chord = SUPER+R ; {Q,R,W} , exec , notify-send rotate-{270,180,90}
 - `_` is the empty element (`{_,SHIFT+}` = "without / with SHIFT").
 - Single-character ranges expand: `{1-9,0}` = `1,2,...,9,0`, `{a-e}` etc.
 - If the command part has no groups it's reused verbatim for every expansion.
-- Braces in the command stay literal when the key sequence has no groups
-  (so `exec , awk '{print $1}'` is safe); at most 512 expansions per line.
+- Groups **only in the command** create a cycling chord (see above).
+- **Braces are always special** (as in sxhkd) — escape literal ones with `\`:
+  `exec , awk '\{print $1\}'`. At most 512 expansions per line.
 
-- Steps are separated by `;`. Within a step, modifiers and the key are joined
-  with `+` (`SUPER+SHIFT+X`). `code:NN` is accepted for raw keycodes.
+- Steps are separated by `;` (or `:` to engage locked mode from that step on).
+  Within a step, modifiers and the key are joined with `+` (`SUPER+SHIFT+X`).
+  `code:NN` is accepted for raw keycodes, `button1`/`button2`/`button3`/`button8`/
+  `button9` or `mouse:NNN` for mouse buttons (scroll wheels can't be steps).
+- Modifiers: everything Hyprland knows (`SUPER`, `SHIFT`, `CTRL`, `ALT`, `MOD1`-`MOD5`,
+  `CAPS`, ...) plus sxhkd's `lock` (=CAPS), `hyper` (=MOD3), `mode_switch` (=MOD5),
+  and `any` (matches every modifier state).
 - `@` prefix on a key: trigger on release. `~` prefix: also pass the key event
   through to the focused app.
 - Everything after the first `,` is `dispatcher , arg` — any Hyprland
   dispatcher works (`exec`, `togglefloating`, `workspace`, ...).
-- Set `abort_key` **before** the `chord` lines.
+- Set the option values (`abort_key`, `swallow`, ...) **before** the `chord` lines.
 
 Behavior, matching sxhkd:
 
 - A pending chain times out after `timeout` ms and resets.
 - Pressing the abort key resets the chain.
-- Pressing any key that doesn't continue the chain aborts it, and the key is
-  swallowed (not delivered to the focused app). Bare modifier presses don't abort.
+- With `swallow = 1` (default), any key that doesn't continue the chain aborts it
+  and is swallowed (not delivered to the focused app); bare modifier presses don't
+  abort. With `swallow = 0`, unmatched keys pass through and the chain stays
+  pending — exactly how sxhkd's selective grabbing behaves.
+- `:` instead of `;` engages **locked mode** once that step is reached: the chain
+  stays resident at its tail (repeat the final key as often as you like), the
+  timeout is disabled, unmatched keys never abort — only the abort key exits.
+- **Cycling**: `{a,b,c}` groups only in the command make one chord whose command
+  advances to the next variant on each press (multiple groups advance together
+  and must be the same length).
 - Chords sharing a prefix (`SUPER+X ; K` and `SUPER+X ; F`) share the pending
   state. One chord being a strict prefix of another is a config error.
 
-Not supported (yet): sxhkd's `:` locked modes, mouse buttons in chords.
+### Runtime control
+
+- `hyprctl dispatch hyprchords_toggle ""` — disable/enable all chords (sxhkd's
+  SIGUSR2 grab toggle). Also accepts `on`/`off`.
+- `hyprctl dispatch hyprchords_abort key` — abort a pending chain from a script
+  (sxhkd's SIGALRM).
+
+### Status events (sxhkd's status fifo)
+
+Chain begin/end is visible as normal `submap>>hc:...` IPC events. Additionally
+the plugin emits `hyprchords>>` events on socket2:
+
+```
+hyprchords>>fire,<chord>,<dispatcher>,<arg>   # a chord fired
+hyprchords>>abort                             # pending chain aborted
+hyprchords>>timeout                           # pending chain timed out
+hyprchords>>lock,<submap>                     # locked mode engaged
+hyprchords>>enabled / disabled                # hyprchords_toggle state
+```
 
 ## Building
 
@@ -112,6 +160,11 @@ socat -u UNIX-CONNECT:$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket
 
 - `SUPER+X` → `submap>>hc:super+x`; `K` within the timeout → dispatcher fires, `submap>>` resets.
 - `SUPER+X` then wait past the timeout → auto reset.
-- `SUPER+X` then an unbound key → chain aborts, key swallowed.
+- `SUPER+X` then an unbound key → chain aborts, key swallowed (with `swallow = 0`:
+  key reaches the app, chain stays pending).
+- `SUPER+R` then `H H H` (locked chord) → repeats, no timeout; `Escape` exits.
+- A cycling chord → alternates its command on each press.
+- `hyprctl dispatch hyprchords_toggle ""` → chords dead; again → alive.
+- `socat ... | grep hyprchords` → `fire`/`abort`/`timeout`/`lock` events appear.
 - `hyprctl reload` repeatedly → `hyprctl binds | grep -c hyprchords` stays stable.
 - `hyprctl plugin unload .../hyprchords.so` → generated binds disappear cleanly.
