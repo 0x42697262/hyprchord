@@ -1,0 +1,9 @@
+[repository]
+name = "hyprchords"
+authors = ["chicken"]
+
+[hyprchords]
+description = "sxhkd-style key chords/chains for Hyprland (SUPER+X ; K)"
+authors = ["chicken"]
+output = "hyprchords.so"
+build = ["make all"]

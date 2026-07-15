@@ -1,0 +1,94 @@
+#pragma once
+
+#include <src/plugins/PluginAPI.hpp>
+#include <src/managers/eventLoop/EventLoopTimer.hpp>
+#include <src/config/values/types/IntValue.hpp>
+#include <src/config/values/types/StringValue.hpp>
+
+#include <hyprutils/signal/Signal.hpp>
+
+#include <expected>
+#include <map>
+#include <optional>
+#include <set>
+#include <string>
+#include <vector>
+
+struct SKeybind;
+
+// one chord in a chain: [MODS +] [~][@]KEY
+struct SChordStep {
+    uint32_t    modmask     = 0;
+    std::string key         = ""; // key name, empty when keycode is used
+    uint32_t    keycode     = 0;  // for code:NN steps
+    bool        release     = false; // @ prefix
+    bool        passthrough = false; // ~ prefix
+    bool        hasMods     = false;
+    std::string repr        = ""; // normalized "super+x"
+};
+
+// a full chain: steps + the dispatcher it fires
+struct SChord {
+    std::vector<SChordStep> steps;
+    std::string             dispatcher;
+    std::string             arg;
+    std::string             repr;
+};
+
+class CChordManager {
+  public:
+    bool                   init(HANDLE handle);
+    void                   shutdown();
+
+    Hyprlang::CParseResult onChordKeyword(const std::string& value);
+
+  private:
+    struct SSubmapInfo {
+        std::set<std::string> stepKeys;             // lowercase key names bound as steps in this submap
+        bool                  hasMachinery = false; // abort-key + catchall binds added
+    };
+
+    std::expected<SChord, std::string> parseChordLine(const std::string& value);
+    std::optional<std::string>         registerChord(const SChord& chord);
+    void                               ensureSubmapMachinery(const std::string& submapName);
+    SP<SKeybind>                       addBind(SKeybind bind);
+
+    SDispatchResult                    enter(const std::string& submapName);
+    SDispatchResult                    exec(const std::string& idxStr);
+    SDispatchResult                    abort(const std::string& mode);
+
+    void                               onTimeout();
+    void                               onPreReload();
+    void                               onReloaded();
+    void                               leaveOurSubmap();
+    bool                               inOurSubmap() const;
+
+    // identifies the key event that last entered/fired a chord, so the
+    // catchall abort bind firing on the same event can be ignored
+    void                               armEventGuard();
+    bool                               eventGuardMatches() const;
+
+    std::vector<SChord>                          m_chords;
+    std::map<std::string, SSubmapInfo>           m_submaps;
+    std::map<std::string, std::string>           m_bindOwners; // bind identity -> "handler|arg", for dedupe/ambiguity
+    std::vector<std::string>                     m_displayKeys;
+    std::vector<SChordStep>                      m_rootSteps; // first chords, for conflict warnings
+    std::vector<std::string>                     m_warnings;
+
+    SP<CEventLoopTimer>                          m_timer;
+    SP<Config::Values::CIntValue>                m_timeout;
+    SP<Config::Values::CStringValue>             m_abortKey;
+    SP<Config::Values::CIntValue>                m_stickyMods;
+
+    Hyprutils::Signal::CHyprSignalListener       m_preReloadListener;
+    Hyprutils::Signal::CHyprSignalListener       m_reloadedListener;
+    Hyprutils::Signal::CHyprSignalListener       m_submapListener;
+
+    struct {
+        uint32_t timeMs = 0;
+        uint32_t code   = 0;
+        bool     valid  = false;
+    } m_eventGuard;
+};
+
+inline CChordManager g_chordManager;
