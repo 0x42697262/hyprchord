@@ -102,12 +102,53 @@ Behavior, matching sxhkd:
 - Chords sharing a prefix (`SUPER+X ; K` and `SUPER+X ; F`) share the pending
   state. One chord being a strict prefix of another is a config error.
 
+### Migrating from sxhkd
+
+Three ways, all sharing the same converter. Every hotkey becomes an `exec`
+chord; commands are copied **verbatim** (`bspc`, `xrandr`, ... are not
+translated to Hyprland dispatchers — replace those by hand). Suspicious
+constructs (mismatched `{}` group sizes, empty group elements, trailing `;`)
+are reported with their sxhkdrc line numbers.
+
+**1. Source the sxhkdrc directly** — zero steps, the sxhkdrc stays the single
+source of truth, re-read on every `hyprctl reload`:
+
+```ini
+plugin {
+    hyprchords {
+        sxhkd_source = ~/.config/sxhkd/sxhkdrc
+    }
+}
+```
+
+An unreadable file is a config error; individual bad hotkeys are skipped and
+reported as notifications after the reload.
+
+**2. One-shot import** — writes a `chord = ...` config file you can hand-edit
+(e.g. to migrate bspc commands to real dispatchers incrementally):
+
+```sh
+hyprctl dispatch hyprchords_import "~/.config/sxhkd/sxhkdrc ~/.config/hypr/chords.conf"
+# then in hyprland.conf:  source = ~/.config/hypr/chords.conf
+```
+
+**3. Offline script** — same conversion without the plugin loaded:
+
+```sh
+tools/sxhkd2hyprchords ~/.config/sxhkd/sxhkdrc -o ~/.config/hypr/chords.conf
+```
+
+Warnings go to stderr; `--no-wrap` emits bare `chord =` lines without the
+`plugin { hyprchords { ... } }` block.
+
 ### Runtime control
 
 - `hyprctl dispatch hyprchords_toggle ""` — disable/enable all chords (sxhkd's
   SIGUSR2 grab toggle). Also accepts `on`/`off`.
 - `hyprctl dispatch hyprchords_abort key` — abort a pending chain from a script
   (sxhkd's SIGALRM).
+- `hyprctl dispatch hyprchords_import "<sxhkdrc> <output.conf>"` — convert an
+  sxhkd config to a hyprchords config file (see *Migrating from sxhkd*).
 
 ### Status events (sxhkd's status fifo)
 

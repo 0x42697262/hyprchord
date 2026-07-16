@@ -1,4 +1,5 @@
 #include "ChordManager.hpp"
+#include "SxhkdConverter.hpp"
 #include "globals.hpp"
 
 #include <src/managers/KeybindManager.hpp>
@@ -14,6 +15,7 @@
 #include <algorithm>
 #include <cctype>
 #include <format>
+#include <fstream>
 
 constexpr const char* SUBMAP_PREFIX = "hc:";
 
@@ -53,6 +55,10 @@ static std::vector<std::string> splitOn(const std::string& s, char sep) {
 
 static Hyprlang::CParseResult chordKeywordHandler(const char* COMMAND, const char* VALUE) {
     return g_chordManager.onChordKeyword(VALUE ? VALUE : "");
+}
+
+static Hyprlang::CParseResult sxhkdSourceHandler(const char* COMMAND, const char* VALUE) {
+    return g_chordManager.onSxhkdSource(VALUE ? VALUE : "");
 }
 
 // ---- sxhkd-style sequence expansion: {a,b,c} groups, `_` = empty, X-Y ranges, \{ \} escapes ----
@@ -331,14 +337,16 @@ bool CChordManager::init(HANDLE handle) {
     // no V2 equivalent exists for plugin config keywords yet
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-    if (!HyprlandAPI::addConfigKeyword(handle, "plugin:hyprchords:chord", chordKeywordHandler, Hyprlang::SHandlerOptions{}))
+    if (!HyprlandAPI::addConfigKeyword(handle, "plugin:hyprchords:chord", chordKeywordHandler, Hyprlang::SHandlerOptions{}) ||
+        !HyprlandAPI::addConfigKeyword(handle, "plugin:hyprchords:sxhkd_source", sxhkdSourceHandler, Hyprlang::SHandlerOptions{}))
         return false; // e.g. Lua config backend, where plugin keywords are unsupported
 #pragma GCC diagnostic pop
 
     if (!HyprlandAPI::addDispatcherV2(handle, "hyprchords_enter", [](std::string arg) { return g_chordManager.enter(arg); }) ||
         !HyprlandAPI::addDispatcherV2(handle, "hyprchords_exec", [](std::string arg) { return g_chordManager.exec(arg); }) ||
         !HyprlandAPI::addDispatcherV2(handle, "hyprchords_abort", [](std::string arg) { return g_chordManager.abort(arg); }) ||
-        !HyprlandAPI::addDispatcherV2(handle, "hyprchords_toggle", [](std::string arg) { return g_chordManager.toggle(arg); }))
+        !HyprlandAPI::addDispatcherV2(handle, "hyprchords_toggle", [](std::string arg) { return g_chordManager.toggle(arg); }) ||
+        !HyprlandAPI::addDispatcherV2(handle, "hyprchords_import", [](std::string arg) { return g_chordManager.importSxhkd(arg); }))
         return false;
 
     m_timer = makeShared<CEventLoopTimer>(std::nullopt, [](SP<CEventLoopTimer>, void*) { g_chordManager.onTimeout(); }, nullptr);
@@ -383,50 +391,66 @@ void CChordManager::shutdown() {
 
 Hyprlang::CParseResult CChordManager::onChordKeyword(const std::string& value) {
     Hyprlang::CParseResult result;
+    if (const auto ERR = addChordLine(value))
+        result.setError(("hyprchords: " + *ERR).c_str());
+    return result;
+}
 
-    const auto             EXPANDED = expandChordLine(value);
-    if (!EXPANDED) {
-        result.setError(("hyprchords: " + EXPANDED.error()).c_str());
+// registers every hotkey of an sxhkdrc as an exec chord (commands verbatim). Problems
+// don't fail the config: they surface as post-reload notifications like other warnings.
+Hyprlang::CParseResult CChordManager::onSxhkdSource(const std::string& value) {
+    Hyprlang::CParseResult result;
+
+    const auto             CONVERTED = SxhkdConverter::convertFile(Hyprutils::String::trim(value));
+    if (!CONVERTED) {
+        result.setError(("hyprchords: sxhkd_source: " + CONVERTED.error()).c_str());
         return result;
     }
+
+    for (const auto& WARNING : CONVERTED->warnings)
+        m_warnings.push_back("sxhkd_source " + WARNING);
+
+    for (const auto& ITEM : CONVERTED->items) {
+        if (ITEM.type != SxhkdConverter::eItemType::CHORD)
+            continue;
+        if (const auto ERR = addChordLine(ITEM.text))
+            m_warnings.push_back(std::format("sxhkd_source line {}: {}", ITEM.srcLine, *ERR));
+    }
+
+    return result;
+}
+
+std::optional<std::string> CChordManager::addChordLine(const std::string& value) {
+    const auto EXPANDED = expandChordLine(value);
+    if (!EXPANDED)
+        return EXPANDED.error();
 
     if (EXPANDED->cycle) {
         // same key sequence, cycling command variants
         SChord base;
         for (size_t i = 0; i < EXPANDED->lines.size(); ++i) {
             auto parsed = parseChordLine(EXPANDED->lines[i]);
-            if (!parsed) {
-                result.setError(std::format("hyprchords: {} (cycle variant '{}')", parsed.error(), Hyprutils::String::trim(EXPANDED->lines[i])).c_str());
-                return result;
-            }
+            if (!parsed)
+                return std::format("{} (cycle variant '{}')", parsed.error(), Hyprutils::String::trim(EXPANDED->lines[i]));
             if (i == 0)
                 base = *parsed;
             base.cycle.emplace_back(parsed->dispatcher, parsed->arg);
         }
-
-        if (const auto ERR = registerChord(base)) {
-            result.setError(("hyprchords: " + *ERR).c_str());
-            return result;
-        }
-        return result;
+        return registerChord(base);
     }
 
     for (const auto& LINE : EXPANDED->lines) {
         const auto CONTEXT = EXPANDED->lines.size() > 1 ? std::format(" (expanded to '{}')", Hyprutils::String::trim(LINE)) : "";
 
         auto       parsed = parseChordLine(LINE);
-        if (!parsed) {
-            result.setError(("hyprchords: " + parsed.error() + CONTEXT).c_str());
-            return result;
-        }
+        if (!parsed)
+            return parsed.error() + CONTEXT;
 
-        if (const auto ERR = registerChord(*parsed)) {
-            result.setError(("hyprchords: " + *ERR + CONTEXT).c_str());
-            return result;
-        }
+        if (const auto ERR = registerChord(*parsed))
+            return *ERR + CONTEXT;
     }
 
-    return result;
+    return std::nullopt;
 }
 
 std::expected<SChord, std::string> CChordManager::parseChordLine(const std::string& value) {
@@ -796,6 +820,34 @@ SDispatchResult CChordManager::toggle(const std::string& arg) {
         leaveOurSubmap();
 
     ipcEvent(m_enabled ? "enabled" : "disabled");
+    return {};
+}
+
+// hyprchords_import "SRC DST": one-shot sxhkdrc -> hyprchords config file conversion
+SDispatchResult CChordManager::importSxhkd(const std::string& arg) {
+    const auto TRIMMED = Hyprutils::String::trim(arg);
+    const auto SPACE   = TRIMMED.find(' ');
+    if (SPACE == std::string::npos)
+        return {.success = false, .error = "usage: hyprchords_import <sxhkdrc> <output.conf>"};
+
+    const auto SRC       = Hyprutils::String::trim(TRIMMED.substr(0, SPACE));
+    const auto DST       = SxhkdConverter::expandTilde(Hyprutils::String::trim(TRIMMED.substr(SPACE + 1)));
+    const auto CONVERTED = SxhkdConverter::convertFile(SRC);
+    if (!CONVERTED)
+        return {.success = false, .error = "hyprchords_import: " + CONVERTED.error()};
+
+    std::ofstream out(DST);
+    if (!out)
+        return {.success = false, .error = "hyprchords_import: cannot write " + DST};
+    out << SxhkdConverter::serialize(*CONVERTED, SRC);
+
+    notify(std::format("imported {} chords from {} into {}; add 'source = {}' to hyprland.conf", CONVERTED->chords, SRC, DST, DST));
+    constexpr size_t MAXNOTIFS = 3;
+    for (size_t i = 0; i < CONVERTED->warnings.size() && i < MAXNOTIFS; ++i)
+        notify(CONVERTED->warnings[i]);
+    if (CONVERTED->warnings.size() > MAXNOTIFS)
+        notify(std::format("...and {} more warnings", CONVERTED->warnings.size() - MAXNOTIFS));
+
     return {};
 }
 

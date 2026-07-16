@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""Convert an sxhkdrc into hyprchords config.
+
+Hotkeys become `chord = KEYS , exec , COMMAND` lines (commands are kept
+verbatim — bspc etc. are NOT translated to Hyprland dispatchers). Comments and
+blank-line grouping are preserved. {...} groups, ranges, `_`, chain `;`/`:`
+separators and `~`/`@` prefixes pass through unchanged: hyprchords implements
+sxhkd's expansion semantics natively.
+
+Usage:
+    sxhkd2hyprchords [sxhkdrc] [-o hyprchords.conf] [--no-wrap]
+
+Default input is ~/.config/sxhkd/sxhkdrc; output goes to stdout. The result is
+wrapped in a `plugin { hyprchords { ... } }` block unless --no-wrap is given —
+save it to a file and `source = ...` it from hyprland.conf.
+
+Suspicious constructs (mismatched {} group sizes, empty group elements,
+trailing chain separators) are converted as-is but reported on stderr.
+"""
+
+import argparse
+import os
+import re
+import sys
+
+# sxhkd modifier name -> hyprchords/Hyprland name (keys are matched before '+')
+MOD_MAP = {
+    "super": "SUPER",
+    "alt": "ALT",
+    "meta": "ALT",
+    "shift": "SHIFT",
+    "ctrl": "CTRL",
+    "control": "CTRL",
+    "hyper": "hyper",
+    "lock": "lock",
+    "mode_switch": "mode_switch",
+    "any": "any",
+    "mod1": "MOD1",
+    "mod2": "MOD2",
+    "mod3": "MOD3",
+    "mod4": "MOD4",
+    "mod5": "MOD5",
+}
+
+MOD_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(" + "|".join(MOD_MAP) + r")\+",
+    re.IGNORECASE,
+)
+
+
+def warn(lineno, msg):
+    print(f"sxhkd2hyprchords: line {lineno}: {msg}", file=sys.stderr)
+
+
+# ---- sxhkdrc parsing ----
+
+def parse_items(lines):
+    """Returns a list of ('blank',), ('comment', text), ('hotkey', keys, cmd, lineno)."""
+    items = []
+    i, n = 0, len(lines)
+
+    def take_logical(start):
+        """Join backslash-continued physical lines into one logical line."""
+        parts, j = [], start
+        while j < n:
+            raw = lines[j].rstrip()
+            j += 1
+            if raw.endswith("\\"):
+                parts.append(raw[:-1].strip())
+            else:
+                parts.append(raw.strip())
+                break
+        return " ".join(p for p in parts if p), j
+
+    while i < n:
+        stripped = lines[i].strip()
+        if not stripped:
+            items.append(("blank",))
+            i += 1
+            continue
+        if stripped.startswith("#"):
+            items.append(("comment", stripped))
+            i += 1
+            continue
+
+        indented = lines[i][0] in " \t"
+        lineno = i + 1
+        logical, i = take_logical(i)
+
+        if indented:  # command line: attach to the most recent hotkey
+            last = next((j for j in range(len(items) - 1, -1, -1) if items[j][0] == "hotkey"), None)
+            if last is None:
+                warn(lineno, "command line without a preceding hotkey, skipped")
+            elif items[last][2] is not None:
+                warn(lineno, "extra command line for one hotkey, skipped")
+            else:
+                items[last] = ("hotkey", items[last][1], logical, items[last][3])
+        else:
+            items.append(("hotkey", logical, None, lineno))
+    return items
+
+
+# ---- {} group inspection (mirrors the plugin's pushElement semantics) ----
+
+def scan_groups(s):
+    """Returns a list of per-group element lists, honoring \\{ \\} escapes."""
+    groups, i = [], 0
+    while i < len(s):
+        if s[i] == "\\" and i + 1 < len(s) and s[i + 1] in "{}":
+            i += 2
+            continue
+        if s[i] == "{":
+            elems, elem = [], ""
+            j = i + 1
+            while j < len(s):
+                if s[j] == "\\" and j + 1 < len(s) and s[j + 1] in "{}":
+                    elem += s[j + 1]
+                    j += 2
+                    continue
+                if s[j] == "}":
+                    break
+                if s[j] == ",":
+                    elems.append(elem.strip())
+                    elem = ""
+                    j += 1
+                    continue
+                elem += s[j]
+                j += 1
+            elems.append(elem.strip())
+            groups.append(elems)
+            i = j + 1
+            continue
+        i += 1
+    return groups
+
+
+def element_count(elems):
+    """Element count after single-char range expansion (1-9 -> 9 elements)."""
+    total = 0
+    for e in elems:
+        if (
+            len(e) == 3
+            and e[1] == "-"
+            and e[0] <= e[2]
+            and ((e[0].isdigit() and e[2].isdigit()) or (e[0].isalpha() and e[2].isalpha()))
+        ):
+            total += ord(e[2]) - ord(e[0]) + 1
+        else:
+            total += 1
+    return total
+
+
+# ---- conversion ----
+
+def split_steps(keys):
+    """Split a hotkey on top-level ';'/':' -> (steps, separators)."""
+    steps, seps, cur, depth = [], [], "", 0
+    i = 0
+    while i < len(keys):
+        c = keys[i]
+        if c == "\\" and i + 1 < len(keys) and keys[i + 1] in "{}":
+            cur += keys[i : i + 2]
+            i += 2
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth = max(0, depth - 1)
+        elif c in ";:" and depth == 0:
+            steps.append(cur)
+            seps.append(c)
+            cur = ""
+            i += 1
+            continue
+        cur += c
+        i += 1
+    steps.append(cur)
+    return steps, seps
+
+
+def convert_keys(keys, lineno):
+    steps, seps = split_steps(keys)
+
+    while steps and not steps[-1].strip():
+        steps.pop()
+        seps.pop()
+        warn(lineno, f"'{keys.strip()}': dropped trailing empty chain step")
+
+    out = []
+    for step in steps:
+        step = re.sub(r"\s+", "", step)
+        if not step:
+            warn(lineno, f"'{keys.strip()}': empty chain step")
+        step = MOD_RE.sub(lambda m: MOD_MAP[m.group(1).lower()] + "+", step)
+        out.append(step)
+
+    result = out[0] if out else ""
+    for sep, step in zip(seps, out[1:]):
+        result += f" {sep} {step}"
+    return result
+
+
+def lint(keys, cmd, lineno):
+    kgroups, cgroups = scan_groups(keys), scan_groups(cmd)
+    for g in kgroups + cgroups:
+        if any(e == "" for e in g):
+            warn(lineno, "empty element in a {} group (did you mean '_', or a stray trailing comma?)")
+    if kgroups and cgroups:
+        if len(cgroups) not in (0, len(kgroups)):
+            warn(lineno, f"{len(kgroups)} {{}} groups in the hotkey but {len(cgroups)} in the command")
+        else:
+            for idx, (kg, cg) in enumerate(zip(kgroups, cgroups)):
+                if element_count(kg) != element_count(cg):
+                    warn(
+                        lineno,
+                        f"{{}} group {idx + 1}: {element_count(kg)} elements in the hotkey "
+                        f"but {element_count(cg)} in the command",
+                    )
+
+
+def convert(text):
+    out = []
+    prev_blank = True  # collapse leading/duplicate blanks
+    for item in parse_items(text.splitlines()):
+        if item[0] == "blank":
+            if not prev_blank:
+                out.append("")
+            prev_blank = True
+            continue
+        prev_blank = False
+        if item[0] == "comment":
+            out.append(item[1])
+            continue
+
+        _, keys, cmd, lineno = item
+        if cmd is None:
+            warn(lineno, f"hotkey '{keys}' has no command, skipped")
+            out.append(f"# skipped (no command): {keys}")
+            continue
+
+        lint(keys, cmd, lineno)
+        cmd = re.sub(r"\s+", " ", cmd).strip()
+        out.append(f"chord = {convert_keys(keys, lineno)} , exec , {cmd}")
+    while out and out[-1] == "":
+        out.pop()
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Convert an sxhkdrc into hyprchords chord = ... lines.",
+        epilog="Commands are copied verbatim (bspc etc. are not translated).",
+    )
+    ap.add_argument(
+        "sxhkdrc",
+        nargs="?",
+        default=os.path.expanduser("~/.config/sxhkd/sxhkdrc"),
+        help="input file (default: ~/.config/sxhkd/sxhkdrc)",
+    )
+    ap.add_argument("-o", "--output", help="output file (default: stdout)")
+    ap.add_argument(
+        "--no-wrap",
+        action="store_true",
+        help="emit bare chord = lines instead of a plugin { hyprchords { ... } } block",
+    )
+    args = ap.parse_args()
+
+    try:
+        with open(args.sxhkdrc) as f:
+            text = f.read()
+    except OSError as e:
+        sys.exit(f"sxhkd2hyprchords: {e}")
+
+    body = convert(text)
+    if args.no_wrap:
+        result = "\n".join(body) + "\n"
+    else:
+        indented = [("        " + l if l else "") for l in body]
+        result = "\n".join(
+            [f"# generated by sxhkd2hyprchords from {args.sxhkdrc}", "plugin {", "    hyprchords {"]
+            + indented
+            + ["    }", "}"]
+        ) + "\n"
+
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(result)
+    else:
+        sys.stdout.write(result)
+
+
+if __name__ == "__main__":
+    main()

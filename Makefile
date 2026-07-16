@@ -1,6 +1,6 @@
 TARGET = hyprchords.so
-SRC = src/main.cpp src/ChordManager.cpp
-HDR = src/ChordManager.hpp src/globals.hpp
+SRC = src/main.cpp src/ChordManager.cpp src/SxhkdConverter.cpp
+HDR = src/ChordManager.hpp src/SxhkdConverter.hpp src/globals.hpp
 
 CXXFLAGS += -shared -fPIC --no-gnu-unique -std=c++26 -Wall -O2
 

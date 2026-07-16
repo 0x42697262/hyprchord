@@ -47,6 +47,7 @@ class CChordManager {
     void                   shutdown();
 
     Hyprlang::CParseResult onChordKeyword(const std::string& value);
+    Hyprlang::CParseResult onSxhkdSource(const std::string& value);
 
   private:
     struct SSubmapInfo {
@@ -55,6 +56,7 @@ class CChordManager {
     };
 
     std::expected<SChord, std::string> parseChordLine(const std::string& value);
+    std::optional<std::string>         addChordLine(const std::string& value);
     std::optional<std::string>         registerChord(const SChord& chord);
     void                               ensureSubmapMachinery(const std::string& submapName);
     SP<SKeybind>                       addBind(SKeybind bind);
@@ -63,6 +65,7 @@ class CChordManager {
     SDispatchResult                    exec(const std::string& idxStr);
     SDispatchResult                    abort(const std::string& mode);
     SDispatchResult                    toggle(const std::string& arg);
+    SDispatchResult                    importSxhkd(const std::string& arg);
 
     void                               onTimeout();
     void                               onPreReload();
