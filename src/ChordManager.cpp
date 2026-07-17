@@ -63,7 +63,20 @@ static Hyprlang::CParseResult sxhkdSourceHandler(const char* COMMAND, const char
 }
 
 // Lua config: hl.plugin.hyprchords.chord("SUPER+X ; K , exec , kitty")
+//         or: hl.plugin.hyprchords.chord("SUPER+X ; K", function() ... end)
+// The function form takes a key sequence only; the action ref is held in the lua
+// registry and dies with the config state (chords are re-registered every reload).
 static int luaChordFn(lua_State* L) {
+    if (lua_gettop(L) >= 2 && !lua_isnil(L, 2)) {
+        luaL_checktype(L, 2, LUA_TFUNCTION);
+        lua_pushvalue(L, 2);
+        const int  REF    = luaL_ref(L, LUA_REGISTRYINDEX);
+        const auto RESULT = g_chordManager.onChordLua(luaL_checkstring(L, 1), L, REF);
+        if (RESULT.error)
+            return luaL_error(L, "hyprchords.chord: %s", RESULT.getError());
+        return 0;
+    }
+
     const auto RESULT = g_chordManager.onChordKeyword(luaL_checkstring(L, 1));
     if (RESULT.error)
         return luaL_error(L, "hyprchords.chord: %s", RESULT.getError());
@@ -417,6 +430,14 @@ Hyprlang::CParseResult CChordManager::onChordKeyword(const std::string& value) {
     return result;
 }
 
+Hyprlang::CParseResult CChordManager::onChordLua(const std::string& steps, lua_State* L, int ref) {
+    Hyprlang::CParseResult result;
+    m_luaState = L;
+    if (const auto ERR = addChordLine(steps, ref))
+        result.setError(("hyprchords: " + *ERR).c_str());
+    return result;
+}
+
 // registers every hotkey of an sxhkdrc as an exec chord (commands verbatim). Problems
 // don't fail the config: they surface as post-reload notifications like other warnings.
 Hyprlang::CParseResult CChordManager::onSxhkdSource(const std::string& value) {
@@ -441,8 +462,13 @@ Hyprlang::CParseResult CChordManager::onSxhkdSource(const std::string& value) {
     return result;
 }
 
-std::optional<std::string> CChordManager::addChordLine(const std::string& value) {
-    const auto EXPANDED = expandChordLine(value);
+std::optional<std::string> CChordManager::addChordLine(const std::string& value, int luaRef) {
+    const bool LUA = luaRef != LUA_NOREF;
+    if (LUA && findTopLevelComma(value) != std::string::npos)
+        return "lua-action chords take a key sequence only (STEP ; STEP ...), no dispatcher/arg";
+
+    // steps-only lua form: synthesize a placeholder command so brace expansion applies
+    const auto EXPANDED = expandChordLine(LUA ? value + " , lua" : value);
     if (!EXPANDED)
         return EXPANDED.error();
 
@@ -463,10 +489,11 @@ std::optional<std::string> CChordManager::addChordLine(const std::string& value)
     for (const auto& LINE : EXPANDED->lines) {
         const auto CONTEXT = EXPANDED->lines.size() > 1 ? std::format(" (expanded to '{}')", Hyprutils::String::trim(LINE)) : "";
 
-        auto       parsed = parseChordLine(LINE);
+        auto       parsed = parseChordLine(LINE, LUA);
         if (!parsed)
             return parsed.error() + CONTEXT;
 
+        parsed->luaRef = luaRef;
         if (const auto ERR = registerChord(*parsed))
             return *ERR + CONTEXT;
     }
@@ -474,7 +501,7 @@ std::optional<std::string> CChordManager::addChordLine(const std::string& value)
     return std::nullopt;
 }
 
-std::expected<SChord, std::string> CChordManager::parseChordLine(const std::string& value) {
+std::expected<SChord, std::string> CChordManager::parseChordLine(const std::string& value, bool luaAction) {
     // STEP (;|:) STEP ... , dispatcher , arg   — braces are already expanded here
     const auto FIRSTCOMMA = value.find(',');
     if (FIRSTCOMMA == std::string::npos)
@@ -496,10 +523,12 @@ std::expected<SChord, std::string> CChordManager::parseChordLine(const std::stri
         return std::unexpected("empty chord sequence");
     if (chord.dispatcher.empty())
         return std::unexpected("missing dispatcher");
-    if (chord.dispatcher.starts_with("hyprchords_"))
-        return std::unexpected("cannot target hyprchords' own dispatchers");
-    if (!g_pKeybindManager->m_dispatchers.contains(chord.dispatcher))
-        return std::unexpected("no such dispatcher: " + chord.dispatcher);
+    if (!luaAction) { // lua actions carry the synthesized placeholder dispatcher "lua"
+        if (chord.dispatcher.starts_with("hyprchords_"))
+            return std::unexpected("cannot target hyprchords' own dispatchers");
+        if (!g_pKeybindManager->m_dispatchers.contains(chord.dispatcher))
+            return std::unexpected("no such dispatcher: " + chord.dispatcher);
+    }
 
     for (const auto& [RAWSTEP, LOCK] : splitSteps(SEQ)) {
         if (RAWSTEP.empty())
@@ -782,6 +811,21 @@ SDispatchResult CChordManager::exec(const std::string& idxStr) {
             (void)Config::Actions::setSubmap("reset");
         if (m_timer)
             m_timer->updateTimeout(std::nullopt);
+    }
+
+    if (CHORD.luaRef != LUA_NOREF) {
+        ipcEvent(std::format("fire,{},lua,", CHORD.repr));
+        if (!m_luaState)
+            return SDispatchResult{.success = false, .error = "hyprchords: no lua state for lua action"};
+        lua_rawgeti(m_luaState, LUA_REGISTRYINDEX, CHORD.luaRef);
+        if (lua_pcall(m_luaState, 0, 0, 0) != LUA_OK) {
+            const char*       RAW = lua_tostring(m_luaState, -1);
+            const std::string ERR = RAW ? RAW : "unknown error";
+            lua_pop(m_luaState, 1);
+            notify("lua action error: " + ERR);
+            return SDispatchResult{.success = false, .error = "hyprchords: lua action error: " + ERR};
+        }
+        return {};
     }
 
     std::string dispatcher = CHORD.dispatcher;

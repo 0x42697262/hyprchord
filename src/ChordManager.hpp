@@ -7,6 +7,8 @@
 
 #include <hyprutils/signal/Signal.hpp>
 
+#include <lua.hpp>
+
 #include <expected>
 #include <map>
 #include <optional>
@@ -35,6 +37,7 @@ struct SChord {
     std::vector<SChordStep>                          steps;
     std::string                                      dispatcher;
     std::string                                      arg;
+    int                                              luaRef = LUA_NOREF; // registry ref of a lua action; when set, dispatcher/arg are unused
     std::vector<std::pair<std::string, std::string>> cycle; // sxhkd cycling: command variants, advanced per fire
     size_t                                           cyclePos   = 0;
     bool                                             lockOnFire = false; // final step engages locked mode
@@ -47,6 +50,7 @@ class CChordManager {
     void                   shutdown();
 
     Hyprlang::CParseResult onChordKeyword(const std::string& value);
+    Hyprlang::CParseResult onChordLua(const std::string& steps, lua_State* L, int ref);
     Hyprlang::CParseResult onSxhkdSource(const std::string& value);
 
   private:
@@ -55,8 +59,8 @@ class CChordManager {
         bool                  hasMachinery = false; // abort-key (+ catchall) binds added
     };
 
-    std::expected<SChord, std::string> parseChordLine(const std::string& value);
-    std::optional<std::string>         addChordLine(const std::string& value);
+    std::expected<SChord, std::string> parseChordLine(const std::string& value, bool luaAction = false);
+    std::optional<std::string>         addChordLine(const std::string& value, int luaRef = LUA_NOREF);
     std::optional<std::string>         registerChord(const SChord& chord);
     void                               ensureSubmapMachinery(const std::string& submapName);
     SP<SKeybind>                       addBind(SKeybind bind);
@@ -88,6 +92,12 @@ class CChordManager {
 
     bool                                         m_locked  = false; // a ':' chord matched; only the abort key exits
     bool                                         m_enabled = true;  // hyprchords_toggle state
+
+    // state of the most recent lua chord registration. Chords (and their refs) are dropped
+    // on config.preReload, so refs never outlive this state; refs are deliberately never
+    // luaL_unref'd — reload order vs state teardown isn't guaranteed, and registry entries
+    // die with the state anyway
+    lua_State*                                   m_luaState = nullptr;
 
     SP<CEventLoopTimer>                          m_timer;
     SP<Config::Values::CIntValue>                m_timeout;
