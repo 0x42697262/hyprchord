@@ -15,7 +15,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     if (!g_chordManager.init(handle)) {
         HyprlandAPI::addNotificationV2(
-            handle, {{"text", std::string{"[hyprchords] failed to initialize (Lua config backends are not supported yet)"}}, {"time", uint64_t{10000}}, {"color", CHyprColor{0}}, {"icon", ICON_ERROR}});
+            handle, {{"text", std::string{"[hyprchords] failed to initialize"}}, {"time", uint64_t{10000}}, {"color", CHyprColor{0}}, {"icon", ICON_ERROR}});
         throw std::runtime_error("hyprchords: initialization failed");
     }
 

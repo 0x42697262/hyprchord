@@ -11,6 +11,7 @@
 
 #include <hyprutils/string/String.hpp>
 #include <xkbcommon/xkbcommon.h>
+#include <lua.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -59,6 +60,22 @@ static Hyprlang::CParseResult chordKeywordHandler(const char* COMMAND, const cha
 
 static Hyprlang::CParseResult sxhkdSourceHandler(const char* COMMAND, const char* VALUE) {
     return g_chordManager.onSxhkdSource(VALUE ? VALUE : "");
+}
+
+// Lua config: hl.plugin.hyprchords.chord("SUPER+X ; K , exec , kitty")
+static int luaChordFn(lua_State* L) {
+    const auto RESULT = g_chordManager.onChordKeyword(luaL_checkstring(L, 1));
+    if (RESULT.error)
+        return luaL_error(L, "hyprchords.chord: %s", RESULT.getError());
+    return 0;
+}
+
+// Lua config: hl.plugin.hyprchords.sxhkd_source("~/.config/sxhkd/sxhkdrc")
+static int luaSxhkdSourceFn(lua_State* L) {
+    const auto RESULT = g_chordManager.onSxhkdSource(luaL_checkstring(L, 1));
+    if (RESULT.error)
+        return luaL_error(L, "hyprchords.sxhkd_source: %s", RESULT.getError());
+    return 0;
 }
 
 // ---- sxhkd-style sequence expansion: {a,b,c} groups, `_` = empty, X-Y ranges, \{ \} escapes ----
@@ -334,13 +351,17 @@ bool CChordManager::init(HANDLE handle) {
         !HyprlandAPI::addConfigValueV2(handle, m_swallow))
         return false;
 
-    // no V2 equivalent exists for plugin config keywords yet
+    // keywords cover the legacy .conf backend, lua fns the Lua one; either family
+    // failing to register just means that backend is inactive
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-    if (!HyprlandAPI::addConfigKeyword(handle, "plugin:hyprchords:chord", chordKeywordHandler, Hyprlang::SHandlerOptions{}) ||
-        !HyprlandAPI::addConfigKeyword(handle, "plugin:hyprchords:sxhkd_source", sxhkdSourceHandler, Hyprlang::SHandlerOptions{}))
-        return false; // e.g. Lua config backend, where plugin keywords are unsupported
+    const bool KEYWORDS = HyprlandAPI::addConfigKeyword(handle, "plugin:hyprchords:chord", chordKeywordHandler, Hyprlang::SHandlerOptions{}) &&
+        HyprlandAPI::addConfigKeyword(handle, "plugin:hyprchords:sxhkd_source", sxhkdSourceHandler, Hyprlang::SHandlerOptions{});
 #pragma GCC diagnostic pop
+    const bool LUAFNS = HyprlandAPI::addLuaFunction(handle, "hyprchords", "chord", luaChordFn) && //
+        HyprlandAPI::addLuaFunction(handle, "hyprchords", "sxhkd_source", luaSxhkdSourceFn);
+    if (!KEYWORDS && !LUAFNS)
+        return false;
 
     if (!HyprlandAPI::addDispatcherV2(handle, "hyprchords_enter", [](std::string arg) { return g_chordManager.enter(arg); }) ||
         !HyprlandAPI::addDispatcherV2(handle, "hyprchords_exec", [](std::string arg) { return g_chordManager.exec(arg); }) ||
