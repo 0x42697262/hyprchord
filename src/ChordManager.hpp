@@ -53,6 +53,10 @@ class CChordManager {
     Hyprlang::CParseResult onChordLua(const std::string& steps, lua_State* L, int ref);
     Hyprlang::CParseResult onSxhkdSource(const std::string& value);
 
+    // fire a registered chord's action by index (hl.plugin.hyprchords.fire),
+    // same path as a completed key chain
+    SDispatchResult        fire(const std::string& idxStr) { return exec(idxStr); }
+
   private:
     struct SSubmapInfo {
         std::set<std::string> stepKeys;             // lowercase key names bound as steps in this submap

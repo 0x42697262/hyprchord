@@ -91,6 +91,14 @@ static int luaSxhkdSourceFn(lua_State* L) {
     return 0;
 }
 
+// Lua: hl.plugin.hyprchords.fire(idx) — fire a registered chord's action by index
+static int luaFireFn(lua_State* L) {
+    const auto RESULT = g_chordManager.fire(std::to_string(luaL_checkinteger(L, 1)));
+    if (!RESULT.success)
+        return luaL_error(L, "hyprchords.fire: %s", RESULT.error.c_str());
+    return 0;
+}
+
 // ---- sxhkd-style sequence expansion: {a,b,c} groups, `_` = empty, X-Y ranges, \{ \} escapes ----
 
 struct SExpansionPart {
@@ -372,7 +380,8 @@ bool CChordManager::init(HANDLE handle) {
         HyprlandAPI::addConfigKeyword(handle, "plugin:hyprchords:sxhkd_source", sxhkdSourceHandler, Hyprlang::SHandlerOptions{});
 #pragma GCC diagnostic pop
     const bool LUAFNS = HyprlandAPI::addLuaFunction(handle, "hyprchords", "chord", luaChordFn) && //
-        HyprlandAPI::addLuaFunction(handle, "hyprchords", "sxhkd_source", luaSxhkdSourceFn);
+        HyprlandAPI::addLuaFunction(handle, "hyprchords", "sxhkd_source", luaSxhkdSourceFn) &&    //
+        HyprlandAPI::addLuaFunction(handle, "hyprchords", "fire", luaFireFn);
     if (!KEYWORDS && !LUAFNS)
         return false;
 
