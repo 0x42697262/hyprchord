@@ -42,6 +42,7 @@ struct SChord {
     size_t                                           cyclePos   = 0;
     bool                                             lockOnFire = false; // final step engages locked mode
     std::string                                      repr;
+    std::string                                      description; // optional user label for the final bind (else auto)
 };
 
 class CChordManager {
@@ -49,8 +50,8 @@ class CChordManager {
     bool                   init(HANDLE handle);
     void                   shutdown();
 
-    Hyprlang::CParseResult onChordKeyword(const std::string& value);
-    Hyprlang::CParseResult onChordLua(const std::string& steps, lua_State* L, int ref);
+    Hyprlang::CParseResult onChordKeyword(const std::string& value, const std::string& description = "");
+    Hyprlang::CParseResult onChordLua(const std::string& steps, lua_State* L, int ref, const std::string& description = "");
     Hyprlang::CParseResult onSxhkdSource(const std::string& value);
 
     // fire a registered chord's action by index (hl.plugin.hyprchords.fire),
@@ -64,7 +65,7 @@ class CChordManager {
     };
 
     std::expected<SChord, std::string> parseChordLine(const std::string& value, bool luaAction = false);
-    std::optional<std::string>         addChordLine(const std::string& value, int luaRef = LUA_NOREF);
+    std::optional<std::string>         addChordLine(const std::string& value, int luaRef = LUA_NOREF, const std::string& description = "");
     std::optional<std::string>         registerChord(const SChord& chord);
     void                               ensureSubmapMachinery(const std::string& submapName);
     SP<SKeybind>                       addBind(SKeybind bind);
